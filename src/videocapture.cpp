@@ -649,6 +649,9 @@ bool VideoCapture::startCapture()
 
     mGrabThread = std::thread( &VideoCapture::grabThreadFunc,this );
 
+    // Flush initial frames to clear any stale data in buffer
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
     return true;
 }
 
@@ -792,7 +795,25 @@ void VideoCapture::grabThreadFunc()
         int ret = ioctl(mFileDesc, VIDIOC_DQBUF, &buf);
         mComMutex.unlock();
 
-        if (buf.bytesused == buf.length && ret == 0 && buf.index < mBufCount)
+        // Validate frame before processing
+        bool frame_valid = (buf.bytesused == buf.length && ret == 0 && buf.index < mBufCount);
+        bool partial_frame = (buf.bytesused > 0 && buf.bytesused != buf.length);
+        
+        // Additional validation: Check if buffer length matches expected frame size
+        // For YUYV format: expected_size = width * height * 2
+        size_t expected_frame_size = static_cast<size_t>(mWidth) * mHeight * 2;
+        if (frame_valid && buf.length != expected_frame_size) {
+            static int size_mismatch_count = 0;
+            if (++size_mismatch_count % 100 == 1 && mParams.verbose >= 2) {
+                std::string msg = "Frame size mismatch: got " + std::to_string(buf.length) + 
+                                  " bytes, expected " + std::to_string(expected_frame_size) + " bytes";
+                WARNING_OUT(mParams.verbose, msg);
+            }
+            frame_valid = false;
+            partial_frame = true;
+        }
+        
+        if (frame_valid)
         {
             mCurrentIndex = buf.index;
             // get buffer timestamp in us
@@ -872,7 +893,22 @@ void VideoCapture::grabThreadFunc()
         }
         else
         {
-            if (buf.bytesused != buf.length)
+            // Für teilweise/korrupte Frames: Buffer sofort wieder freigeben und überspringen
+            if (partial_frame)
+            {
+                // Warnung nur alle 100 Frames ausgeben und nur bei verbose >= 2
+                static int drop_count = 0;
+                if (++drop_count % 100 == 1 && mParams.verbose >= 2) {
+                    std::string msg = "Dropping corrupted frame (bytesused=" + std::to_string(buf.bytesused) + 
+                                      ", expected=" + std::to_string(buf.length) + ")";
+                    WARNING_OUT(mParams.verbose, msg);
+                }
+                
+                mComMutex.lock();
+                ioctl(mFileDesc, VIDIOC_QBUF, &buf);
+                mComMutex.unlock();
+            }
+            else if (buf.bytesused != buf.length && buf.index < mBufCount)
             {
                 mComMutex.lock();
                 ioctl(mFileDesc, VIDIOC_QBUF, &buf);
