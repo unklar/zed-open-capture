@@ -447,6 +447,10 @@ private:
     int xioctl(int fd, uint64_t IOCTL_X, void *arg);            //!< Send ioctl command
     void checkResFps();                                         //!< Check if the Framerate is correct for the selected resolution
     SL_DEVICE getCameraModel(std::string dev_name);     //!< Get the connected camera model
+    void buildHalfSignature(const uint8_t *frame_data, bool right_half,
+                            std::vector<uint8_t> &signature);
+    double signatureDiff(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b);
+    bool shouldDropHalfSwappedFrame(const uint8_t *frame_data);
     // <---- Connection control functions
 
     typedef enum _date_time
@@ -512,6 +516,10 @@ private:
     std::thread mGrabThread;            //!< The video grabbing thread
 
     bool mFirstFrame=true;              //!< Used to initialize the timestamp start point
+    bool mPrevFrameSignaturesValid=false; //!< Used to compare against the previous accepted frame
+    int mRejectNextFrames=0;            //!< Cooldown after a suspicious frame
+    std::vector<uint8_t> mPrevLeftSignature;
+    std::vector<uint8_t> mPrevRightSignature;
 
 #ifdef SENSOR_LOG_AVAILABLE
     // ----> Registers logging

@@ -39,6 +39,8 @@
 #include <fstream>            // for char_traits, basic_istream::operator>>
 
 #include <cmath>              // for round
+#include <limits>
+#include <vector>
 
 #define IOCTL_RETRY 3
 
@@ -111,6 +113,85 @@
 namespace sl_oc {
 
 namespace video {
+
+namespace {
+constexpr int kSignatureWidth = 32;
+constexpr int kSignatureHeight = 24;
+constexpr double kHalfSwapRatio = 0.85;
+constexpr int kHalfSwapCooldownFrames = 1;
+}
+
+void VideoCapture::buildHalfSignature(const uint8_t *frame_data, bool right_half,
+                                      std::vector<uint8_t> &signature)
+{
+    signature.resize(static_cast<size_t>(kSignatureWidth * kSignatureHeight));
+
+    const int half_width = mWidth / 2;
+    const int start_x = right_half ? half_width : 0;
+    const int stride = mWidth * 2;
+
+    for (int sy = 0; sy < kSignatureHeight; ++sy)
+    {
+        const int y = (sy * mHeight) / kSignatureHeight;
+        const uint8_t *row = frame_data + static_cast<size_t>(y) * stride;
+        for (int sx = 0; sx < kSignatureWidth; ++sx)
+        {
+            const int x = start_x + (sx * half_width) / kSignatureWidth;
+            signature[static_cast<size_t>(sy * kSignatureWidth + sx)] = row[static_cast<size_t>(x) * 2];
+        }
+    }
+}
+
+double VideoCapture::signatureDiff(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b)
+{
+    if (a.size() != b.size() || a.empty()) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    double total = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        total += std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i]));
+    }
+    return total / static_cast<double>(a.size());
+}
+
+bool VideoCapture::shouldDropHalfSwappedFrame(const uint8_t *frame_data)
+{
+    if (mWidth <= 0 || mHeight <= 0 || frame_data == nullptr) {
+        return true;
+    }
+
+    std::vector<uint8_t> current_left;
+    std::vector<uint8_t> current_right;
+    buildHalfSignature(frame_data, false, current_left);
+    buildHalfSignature(frame_data, true, current_right);
+
+    if (!mPrevFrameSignaturesValid) {
+        mPrevLeftSignature = current_left;
+        mPrevRightSignature = current_right;
+        mPrevFrameSignaturesValid = true;
+        return false;
+    }
+
+    const double same_left = signatureDiff(current_left, mPrevLeftSignature);
+    const double same_right = signatureDiff(current_right, mPrevRightSignature);
+    const double cross_left = signatureDiff(current_left, mPrevRightSignature);
+    const double cross_right = signatureDiff(current_right, mPrevLeftSignature);
+
+    const bool left_cross_better = cross_left < (same_left * kHalfSwapRatio);
+    const bool right_cross_better = cross_right < (same_right * kHalfSwapRatio);
+    const bool swapped_like = left_cross_better && right_cross_better;
+
+    if (swapped_like) {
+        mRejectNextFrames = kHalfSwapCooldownFrames;
+        return true;
+    }
+
+    mPrevLeftSignature = std::move(current_left);
+    mPrevRightSignature = std::move(current_right);
+    mPrevFrameSignaturesValid = true;
+    return false;
+}
 
 VideoCapture::VideoCapture(VideoParams params)
 {
@@ -188,6 +269,11 @@ void VideoCapture::reset()
         delete [] mLastFrame.data;
         mLastFrame.data = nullptr;
     }
+
+    mPrevLeftSignature.clear();
+    mPrevRightSignature.clear();
+    mPrevFrameSignaturesValid = false;
+    mRejectNextFrames = 0;
 
     if( mParams.verbose && mInitialized)
     {
@@ -841,6 +927,30 @@ void VideoCapture::grabThreadFunc()
             // cvt to ns
             rel_ts *= 1000;
 
+            if (mRejectNextFrames > 0) {
+                --mRejectNextFrames;
+                mComMutex.lock();
+                ioctl(mFileDesc, VIDIOC_QBUF, &buf);
+                mComMutex.unlock();
+                buf.bytesused = -1;
+                buf.length = 0;
+                continue;
+            }
+
+            if (shouldDropHalfSwappedFrame(static_cast<const uint8_t*>(mBuffers[mCurrentIndex].start))) {
+                static int drop_swap_count = 0;
+                if (++drop_swap_count % 100 == 1 && mParams.verbose >= 2) {
+                    WARNING_OUT(mParams.verbose, "Dropping suspicious half-swapped frame");
+                }
+
+                mComMutex.lock();
+                ioctl(mFileDesc, VIDIOC_QBUF, &buf);
+                mComMutex.unlock();
+                buf.bytesused = -1;
+                buf.length = 0;
+                continue;
+            }
+
             mBufMutex.lock();
             if (mLastFrame.data != nullptr && mWidth != 0 && mHeight != 0 && mBuffers[mCurrentIndex].start != nullptr)
             {
@@ -925,13 +1035,30 @@ void VideoCapture::grabThreadFunc()
 
 const Frame& VideoCapture::getLastFrame( uint64_t timeout_msec )
 {
+    static thread_local Frame frame_copy;
+    static thread_local std::vector<uint8_t> frame_storage;
+
+    auto copy_frame = [&]() -> const Frame& {
+        const std::lock_guard<std::mutex> lock(mBufMutex);
+        frame_copy = mLastFrame;
+        if (frame_copy.data != nullptr && frame_copy.width != 0 && frame_copy.height != 0 && frame_copy.channels != 0) {
+            const size_t bufSize = static_cast<size_t>(frame_copy.width) * frame_copy.height * frame_copy.channels;
+            frame_storage.resize(bufSize);
+            memcpy(frame_storage.data(), mLastFrame.data, bufSize);
+            frame_copy.data = frame_storage.data();
+        } else {
+            frame_storage.clear();
+        }
+        return frame_copy;
+    };
+
     // ----> Wait for a new frame
     uint64_t time_count = timeout_msec*10;
     while( !mNewFrame )
     {
         if(time_count==0)
         {
-            return mLastFrame;
+            return copy_frame();
         }
         time_count--;
         usleep(100);
@@ -939,9 +1066,11 @@ const Frame& VideoCapture::getLastFrame( uint64_t timeout_msec )
     // <---- Wait for a new frame
 
     // Get the frame mutex
-    const std::lock_guard<std::mutex> lock(mBufMutex);
-    mNewFrame = false;
-    return mLastFrame;
+    {
+        const std::lock_guard<std::mutex> lock(mBufMutex);
+        mNewFrame = false;
+    }
+    return copy_frame();
 }
 
 int VideoCapture::ll_VendorControl(uint8_t *buf, int len, int readMode, bool safe, bool force)
