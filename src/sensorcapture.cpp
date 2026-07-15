@@ -635,7 +635,7 @@ bool SensorCapture::searchForConnectedDev(int* serial_number, unsigned short* fo
 
         if(in_serial_number==0 || sn==in_serial_number)
         {
-            if( pid==SL_USB_PROD_MCU_ZED2_REVA || pid==SL_USB_PROD_MCU_ZED2i_REVA)
+            if( pid==SL_USB_PROD_MCU_ZEDM_REVA || pid==SL_USB_PROD_MCU_ZED2_REVA || pid==SL_USB_PROD_MCU_ZED2i_REVA)
             {
                 found = true;
                 found_serial_number = sn;
@@ -643,7 +643,7 @@ bool SensorCapture::searchForConnectedDev(int* serial_number, unsigned short* fo
             }
             else
             {
-                std::string msg = "The reset function works only for ZED2/ZED2i camera models.";
+                std::string msg = "The reset function works only for ZED-M/ZED2/ZED2i camera models.";
                 std::cerr << msg << std::endl;
 
                 if(in_serial_number==0)
